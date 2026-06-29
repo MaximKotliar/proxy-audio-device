@@ -567,10 +567,11 @@ OSStatus ProxyAudioDevice::Initialize(AudioServerPlugInDriverRef inDriver, Audio
     dispatch_resume(inputMonitoringTimer);
     
     deviceName = copyDeviceNameFromStorage();
-    outputDeviceUID = copyOutputDeviceUIDFromStorage();
+    outputDevicePriorityList = copyOutputDevicePriorityListFromStorage();
     outputDeviceBufferFrameSize = retrieveOutputDeviceBufferFrameSizeFromStorage();
     outputDeviceActiveCondition = retrieveOutputDeviceActiveConditionFromStorage();
     outputDeviceHideWhenUnavailable = retrieveOutputDeviceHideWhenUnavailableFromStorage();
+    outputDeviceAutoFailback = retrieveOutputDeviceAutoFailbackFromStorage();
 
     //    calculate the host ticks per frame
     struct mach_timebase_info theTimeBaseInfo;
@@ -4661,43 +4662,109 @@ Done:
 
 #pragma mark Output Device Operations
 
-AudioDevice ProxyAudioDevice::findTargetOutputAudioDevice() {
-    DebugMsg("ProxyAudio: findTargetOutputAudioDevice");
-    std::vector<AudioObjectID> devices = AudioDevice::allAudioDevices();
-    CFStringSmartRef currentOutputDeviceUID;
-    
+// Returns true if the given device UID currently maps to a device that is both
+// present in the system and reporting itself as alive. "Available" = present AND
+// alive, matching the two failure signals the driver already listens for
+// (devicesListenerProc for removal, outputDeviceAliveListener for death).
+static bool deviceUIDIsAvailable(CFStringRef uid, AudioObjectID &outDeviceID) {
+    outDeviceID = kAudioObjectUnknown;
+
+    if (!uid || CFStringGetLength(uid) == 0) {
+        return false;
+    }
+
+    AudioObjectID deviceID = AudioDevice::audioDeviceIDForDeviceUID(uid);
+
+    if (deviceID == kAudioObjectUnknown) {
+        return false;
+    }
+
+    AudioObjectPropertyAddress aliveAddress = {
+        kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+    UInt32 alive = 0;
+    UInt32 size = sizeof(alive);
+    OSStatus err = AudioObjectGetPropertyData(deviceID, &aliveAddress, 0, NULL, &size, &alive);
+
+    if (err != noErr || alive != 1) {
+        return false;
+    }
+
+    outDeviceID = deviceID;
+    return true;
+}
+
+CFStringRef ProxyAudioDevice::copyChosenTargetDeviceUID(CFStringRef currentActiveUID) {
+    // Snapshot the chain + auto-failback setting so we don't hold stateMutex
+    // across the CoreAudio availability queries below.
+    CFArraySmartRef priorityList;
+    bool autoFailback;
     {
         CAMutex::Locker locker(&stateMutex);
-        
-        if (!outputDeviceUID) {
-            DebugMsg("ProxyAudio: findTargetOutputAudioDevice finished, output device UID is null");
-            return AudioDevice();
-        }
-        
-        currentOutputDeviceUID = CFStringCreateCopy(NULL, outputDeviceUID);
+        priorityList = outputDevicePriorityList ? (CFArrayRef)CFRetain(outputDevicePriorityList) : NULL;
+        autoFailback = outputDeviceAutoFailback;
     }
-    
-    DebugMsg("ProxyAudio: findTargetOutputAudioDevice target UID: %s", CFStringToStdString(currentOutputDeviceUID).c_str());
-    
-    for (AudioObjectID device : devices) {
-        AudioObjectPropertyAddress propertyAddress = {
-            kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMaster};
 
-        CFStringSmartRef uid;
-        UInt32 size = sizeof(CFStringRef);
-        OSStatus err = AudioObjectGetPropertyData(device, &propertyAddress, 0, NULL, &size, &uid);
+    // Walk the chain in priority order and collect the entries that are currently
+    // available. The CFStringRefs are borrowed from priorityList, which stays
+    // retained for the lifetime of this function.
+    std::vector<CFStringRef> availableListed;
+    CFIndex count = priorityList ? CFArrayGetCount(priorityList) : 0;
 
-        if (err == noErr && uid) {
-            if (CFStringCompare(uid, currentOutputDeviceUID, 0) == kCFCompareEqualTo) {
-                DebugMsg("ProxyAudio: findTargetOutputAudioDevice finished, found output device");
-                return AudioDevice(device);
+    for (CFIndex i = 0; i < count; ++i) {
+        CFStringRef uid = (CFStringRef)CFArrayGetValueAtIndex(priorityList, i);
+        AudioObjectID deviceID = kAudioObjectUnknown;
+
+        if (deviceUIDIsAvailable(uid, deviceID)) {
+            availableListed.push_back(uid);
+        }
+    }
+
+    if (!availableListed.empty()) {
+        if (!autoFailback && currentActiveUID && CFStringGetLength(currentActiveUID) > 0) {
+            // Sticky (auto-failback off): keep the current device if it is still
+            // among the available listed devices; otherwise advance to the
+            // highest-priority available one.
+            for (CFStringRef uid : availableListed) {
+                if (CFStringCompare(uid, currentActiveUID, 0) == kCFCompareEqualTo) {
+                    return CFStringCreateCopy(NULL, uid);
+                }
             }
         }
+
+        // Auto-failback on, or the current device is no longer available: use the
+        // highest-priority available listed device.
+        return CFStringCreateCopy(NULL, availableListed.front());
     }
 
-    DebugMsg("ProxyAudio: findTargetOutputAudioDevice finished, not not find output device");
-    
-    return AudioDevice();
+    // No listed device is available: fall back to the current system default
+    // output device (which already excludes the proxy device itself). The
+    // fallback is never sticky -- as soon as any listed device returns, the logic
+    // above selects it on the next re-evaluation, regardless of the auto-failback
+    // setting (the fallback is never in availableListed).
+    return copyDefaultProxyOutputDeviceUID();
+}
+
+AudioDevice ProxyAudioDevice::findTargetOutputAudioDevice(CFStringRef currentActiveUID) {
+    DebugMsg("ProxyAudio: findTargetOutputAudioDevice");
+
+    CFStringSmartRef targetUID = copyChosenTargetDeviceUID(currentActiveUID);
+
+    if (!targetUID || CFStringGetLength(targetUID) == 0) {
+        DebugMsg("ProxyAudio: findTargetOutputAudioDevice finished, no available device");
+        return AudioDevice();
+    }
+
+    DebugMsg("ProxyAudio: findTargetOutputAudioDevice target UID: %s", CFStringToStdString(targetUID).c_str());
+
+    AudioObjectID deviceID = AudioDevice::audioDeviceIDForDeviceUID(targetUID);
+
+    if (deviceID == kAudioObjectUnknown) {
+        DebugMsg("ProxyAudio: findTargetOutputAudioDevice finished, could not resolve device");
+        return AudioDevice();
+    }
+
+    DebugMsg("ProxyAudio: findTargetOutputAudioDevice finished, found output device");
+    return AudioDevice(deviceID);
 }
 
 int ProxyAudioDevice::outputDeviceAliveListenerStatic(AudioObjectID inObjectID,
@@ -4732,6 +4799,13 @@ int ProxyAudioDevice::outputDeviceAliveListener(AudioObjectID inObjectID,
 
     DebugMsg("ProxyAudio: outputDeviceAliveListener output device no longer alive");
     deinitializeOutputDevice();
+
+    // The active device died but other devices in the chain (or the system-default
+    // fallback) may still be available, so immediately re-evaluate and advance
+    // rather than waiting for a separate device-list change event. A dying device
+    // does not always disappear from the device list, so we cannot rely on
+    // devicesListenerProc to fire.
+    setupTargetOutputDevice();
 
     return noErr;
 }
@@ -4889,44 +4963,65 @@ void ProxyAudioDevice::matchOutputDeviceSampleRate()
 
 void ProxyAudioDevice::setupTargetOutputDevice() {
     DebugMsg("ProxyAudio: setupTargetOutputDevice");
-    AudioDevice newOutputDevice = findTargetOutputAudioDevice();
 
+    // Capture the UID of the device currently in use so the selection logic can
+    // honor sticky behavior (auto-failback off): we only stay put if the current
+    // device is still among the available listed devices.
+    CFStringSmartRef currentActiveUID;
+    {
+        CAMutex::Locker locker(outputDeviceMutex);
+        if (outputDevice.isValid()) {
+            currentActiveUID = AudioDevice::copyDeviceUID(outputDevice.id);
+        }
+    }
+
+    AudioDevice newOutputDevice = findTargetOutputAudioDevice(currentActiveUID);
     DebugMsg("ProxyAudio: setupTargetOutputDevice newOutputDevice: %d", newOutputDevice.id);
-    CAMutex::Locker locker(outputDeviceMutex);
-    
-    if (outputDevice.isValid() && outputDevice.id == newOutputDevice.id
-        && outputDevice.bufferFrameSize == outputDeviceBufferFrameSize) {
-        DebugMsg("ProxyAudio: setupTargetOutputDevice no change in device");
-        return;
+
+    AudioObjectID activeDeviceID = kAudioObjectUnknown;
+    {
+        CAMutex::Locker locker(outputDeviceMutex);
+
+        if (outputDevice.isValid() && outputDevice.id == newOutputDevice.id
+            && outputDevice.bufferFrameSize == outputDeviceBufferFrameSize) {
+            DebugMsg("ProxyAudio: setupTargetOutputDevice no change in device");
+            activeDeviceID = outputDevice.id;
+        } else {
+            DebugMsg("ProxyAudio: setupTargetOutputDevice deinitializing old device");
+            // NB: it's important that we not modify OutputDevice until it is no longer playing since
+            // we're not using a locking mechanism on its attributes between this function and its IO
+            // function.
+            deinitializeOutputDeviceNoLock();
+
+            if (newOutputDevice.isValid()) {
+                DebugMsg("ProxyAudio: setupTargetOutputDevice setting up new device");
+                resetInputData();
+                outputDevice = newOutputDevice;
+                outputDevice.setBufferFrameSize(outputDeviceBufferFrameSize);
+                outputDevice.setupIOProc(outputDeviceIOProcStatic, this);
+                outputDevice.addPropertyListener(kAudioDevicePropertyDeviceIsAlive,
+                                                 kAudioObjectPropertyScopeGlobal,
+                                                 kAudioObjectPropertyElementMaster,
+                                                 outputDeviceAliveListenerStatic,
+                                                 this);
+                outputDevice.addPropertyListener(kAudioDevicePropertyNominalSampleRate,
+                                                 kAudioObjectPropertyScopeGlobal,
+                                                 kAudioObjectPropertyElementMaster,
+                                                 outputDeviceSampleRateListenerStatic,
+                                                 this);
+                DebugMsg("ProxyAudio: setupTargetOutputDevice will match sample rate");
+                matchOutputDeviceSampleRateNoLock();
+                activeDeviceID = outputDevice.id;
+            } else {
+                syslog(LOG_WARNING, "ProxyAudio: setupTargetOutputDevice could not find output device");
+            }
+        }
     }
 
-    DebugMsg("ProxyAudio: setupTargetOutputDevice deinitializing old device");
-    // NB: it's important that we not modify OutputDevice until it is no longer playing since
-    // we're not using a locking mechanism on its attributes between this function and its IO
-    // function.
-    deinitializeOutputDeviceNoLock();
-
-    if (newOutputDevice.isValid()) {
-        DebugMsg("ProxyAudio: setupTargetOutputDevice setting up new device");
-        resetInputData();
-        outputDevice = newOutputDevice;
-        outputDevice.setBufferFrameSize(outputDeviceBufferFrameSize);
-        outputDevice.setupIOProc(outputDeviceIOProcStatic, this);
-        outputDevice.addPropertyListener(kAudioDevicePropertyDeviceIsAlive,
-                                         kAudioObjectPropertyScopeGlobal,
-                                         kAudioObjectPropertyElementMaster,
-                                         outputDeviceAliveListenerStatic,
-                                         this);
-        outputDevice.addPropertyListener(kAudioDevicePropertyNominalSampleRate,
-                                         kAudioObjectPropertyScopeGlobal,
-                                         kAudioObjectPropertyElementMaster,
-                                         outputDeviceSampleRateListenerStatic,
-                                         this);
-        DebugMsg("ProxyAudio: setupTargetOutputDevice will match sample rate");
-        matchOutputDeviceSampleRateNoLock();
-    } else {
-        syslog(LOG_WARNING, "ProxyAudio: setupTargetOutputDevice could not find output device");
-    }
+    // Record which device we actually ended up routing to (a chain entry, the
+    // system-default fallback, or none) so the settings app can mark the active
+    // row, read via ConfigType::currentActiveOutputDevice.
+    updateCurrentActiveOutputDeviceUID(activeDeviceID);
 }
 
 void ProxyAudioDevice::initializeOutputDevice() {
@@ -4937,10 +5032,9 @@ void ProxyAudioDevice::initializeOutputDevice() {
                        // in a separate thread from the rest of the driver. Otherwise we'll get
                        // deadlocks!
                        DebugMsg("ProxyAudio: initializeOutputDevice running in separate thread");
-                       if (!outputDeviceUID) {
-                           outputDeviceUID = copyDefaultProxyOutputDeviceUID();
-                       }
-                       
+                       // Device selection is driven entirely by the priority chain
+                       // (and the system-default fallback when no listed device is
+                       // available), resolved in setupTargetOutputDevice.
                        setupTargetOutputDevice();
                        setupAudioDevicesListener();
                    });
@@ -5507,8 +5601,8 @@ void ProxyAudioDevice::parseConfigurationString(CFStringRef configString, Config
 
     CFStringSmartRef actionString = CFStringCreateWithSubstring(NULL, configString, CFRangeMake(0, splitter.location));
 
-    if (CFStringCompare(actionString, CFSTR("outputDevice"), 0) == kCFCompareEqualTo) {
-        action = ConfigType::outputDevice;
+    if (CFStringCompare(actionString, CFSTR("outputDevicePriorityList"), 0) == kCFCompareEqualTo) {
+        action = ConfigType::outputDevicePriorityList;
     } else if (CFStringCompare(actionString, CFSTR("outputDeviceBufferFrameSize"), 0) == kCFCompareEqualTo) {
         action = ConfigType::outputDeviceBufferFrameSize;
     } else if (CFStringCompare(actionString, CFSTR("deviceName"), 0) == kCFCompareEqualTo) {
@@ -5517,6 +5611,8 @@ void ProxyAudioDevice::parseConfigurationString(CFStringRef configString, Config
         action = ConfigType::deviceActiveCondition;
     } else if (CFStringCompare(actionString, CFSTR("outputDeviceHideWhenUnavailable"), 0) == kCFCompareEqualTo) {
         action = ConfigType::deviceHideWhenUnavailable;
+    } else if (CFStringCompare(actionString, CFSTR("outputDeviceAutoFailback"), 0) == kCFCompareEqualTo) {
+        action = ConfigType::outputDeviceAutoFailback;
     } else {
         return;
     }
@@ -5536,8 +5632,8 @@ void ProxyAudioDevice::parseConfigurationString(CFStringRef configString, Config
 
 void ProxyAudioDevice::setConfigurationValue(ConfigType type, CFStringRef value) {
     switch (type) {
-        case ConfigType::outputDevice:
-            setOutputDevice(value);
+        case ConfigType::outputDevicePriorityList:
+            setOutputDevicePriorityList(value);
             break;
 
         case ConfigType::outputDeviceBufferFrameSize:
@@ -5557,6 +5653,11 @@ void ProxyAudioDevice::setConfigurationValue(ConfigType type, CFStringRef value)
             setOutputDeviceHideWhenUnavailable(CFStringGetIntValue(value) != 0);
             break;
 
+        case ConfigType::outputDeviceAutoFailback:
+            // Configurator passes "1" for true and "0" for false.
+            setOutputDeviceAutoFailback(CFStringGetIntValue(value) != 0);
+            break;
+
         default:
             break;
     }
@@ -5564,14 +5665,14 @@ void ProxyAudioDevice::setConfigurationValue(ConfigType type, CFStringRef value)
 
 CFStringRef ProxyAudioDevice::copyConfigurationValue(ConfigType type) {
     CAMutex::Locker locker(stateMutex);
-    
+
     switch (type) {
-        case ConfigType::outputDevice:
-            return CFStringCreateCopy(NULL, outputDeviceUID);
-            
+        case ConfigType::outputDevicePriorityList:
+            return copyOutputDevicePriorityListAsString();
+
         case ConfigType::outputDeviceBufferFrameSize:
             return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), outputDeviceBufferFrameSize);
-                
+
         case ConfigType::deviceName:
             return CFStringCreateCopy(NULL, deviceName);
 
@@ -5580,6 +5681,14 @@ CFStringRef ProxyAudioDevice::copyConfigurationValue(ConfigType type) {
 
         case ConfigType::deviceHideWhenUnavailable:
             return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), outputDeviceHideWhenUnavailable ? 1 : 0);
+
+        case ConfigType::outputDeviceAutoFailback:
+            return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), outputDeviceAutoFailback ? 1 : 0);
+
+        case ConfigType::currentActiveOutputDevice:
+            // Empty string (not NULL) when nothing is active, so the read channel
+            // always returns a valid string the settings app can compare against.
+            return outputDeviceUID ? CFStringCreateCopy(NULL, outputDeviceUID) : CFStringCreateCopy(NULL, CFSTR(""));
 
         default:
             return nullptr;
@@ -5674,54 +5783,123 @@ CFStringRef ProxyAudioDevice::copyDefaultProxyOutputDeviceUID() {
     return nullptr;
 }
 
-CFStringRef ProxyAudioDevice::copyOutputDeviceUIDFromStorage() {
-    DebugMsg("ProxyAudio: copyOutputDeviceUIDFromStorage");
-    
+CFArrayRef ProxyAudioDevice::copyOutputDevicePriorityListFromStorage() {
+    DebugMsg("ProxyAudio: copyOutputDevicePriorityListFromStorage");
+
     if (!gPlugIn_Host) {
-        DebugMsg("ProxyAudio: copyOutputDeviceUIDFromStorage no plugin host");
+        DebugMsg("ProxyAudio: copyOutputDevicePriorityListFromStorage no plugin host");
         return nullptr;
     }
 
-    CFStringRef result = nullptr;
     CFPropertyListSmartRef data;
+    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("outputDevicePriorityList"), &data);
 
-    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("outputDeviceUID"), &data);
-
-    if (data != NULL && CFGetTypeID(data) == CFStringGetTypeID()
-        && CFStringCompare(CFStringRef(CFPropertyListRef(data)), CFSTR(kDevice_UID), 0) != kCFCompareEqualTo) {
-        result = CFStringCreateCopy(NULL, CFStringRef(CFPropertyListRef(data)));
-        DebugMsg("ProxyAudio: copyOutputDeviceUIDFromStorage finished with stored output device UID");
-        return result;
+    if (data == NULL || CFGetTypeID(data) != CFArrayGetTypeID()) {
+        DebugMsg("ProxyAudio: copyOutputDevicePriorityListFromStorage no priority list in storage");
+        return nullptr;
     }
 
-    DebugMsg("ProxyAudio: copyOutputDeviceUIDFromStorage no output device UID in storage");
-    
-    return nullptr;
+    // Defensive copy: keep only string entries, and never the proxy device itself
+    // (which would route audio back into the proxy).
+    CFArrayRef stored = (CFArrayRef)CFPropertyListRef(data);
+    CFIndex count = CFArrayGetCount(stored);
+    CFMutableArrayRef result = CFArrayCreateMutable(NULL, count, &kCFTypeArrayCallBacks);
+
+    for (CFIndex i = 0; i < count; ++i) {
+        CFTypeRef entry = CFArrayGetValueAtIndex(stored, i);
+
+        if (!entry || CFGetTypeID(entry) != CFStringGetTypeID()) {
+            continue;
+        }
+
+        if (CFStringCompare((CFStringRef)entry, CFSTR(kDevice_UID), 0) == kCFCompareEqualTo) {
+            continue;
+        }
+
+        CFArrayAppendValue(result, entry);
+    }
+
+    DebugMsg("ProxyAudio: copyOutputDevicePriorityListFromStorage finished with stored priority list");
+
+    return result;
 }
 
-void ProxyAudioDevice::setOutputDevice(CFStringRef deviceUID) {
-    if (!gPlugIn_Host) {
+void ProxyAudioDevice::setOutputDevicePriorityList(CFStringRef newlineDelimitedUIDs) {
+    if (!gPlugIn_Host || !newlineDelimitedUIDs) {
         return;
     }
-    
+
+    // Parse the newline-delimited UID blob into an ordered array, dropping empty
+    // entries and the proxy device itself.
+    CFArraySmartRef rawList =
+        CFStringCreateArrayBySeparatingStrings(NULL, newlineDelimitedUIDs, kOutputDevicePriorityListSeparator);
+    CFIndex rawCount = rawList ? CFArrayGetCount(rawList) : 0;
+    CFMutableArrayRef newList = CFArrayCreateMutable(NULL, rawCount, &kCFTypeArrayCallBacks);
+
+    for (CFIndex i = 0; i < rawCount; ++i) {
+        CFStringRef uid = (CFStringRef)CFArrayGetValueAtIndex(rawList, i);
+
+        if (!uid || CFStringGetLength(uid) == 0) {
+            continue;
+        }
+
+        if (CFStringCompare(uid, CFSTR(kDevice_UID), 0) == kCFCompareEqualTo) {
+            continue;
+        }
+
+        CFArrayAppendValue(newList, uid);
+    }
+
     {
         CAMutex::Locker locker(&stateMutex);
-        
-        if (outputDeviceUID) {
-            CFRelease(outputDeviceUID);
+
+        if (outputDevicePriorityList) {
+            CFRelease(outputDevicePriorityList);
         }
-        
-        outputDeviceUID = CFStringCreateCopy(NULL, deviceUID); 
+
+        outputDevicePriorityList = newList; // takes ownership of the +1 reference
     }
-    
+
     ExecuteInAudioOutputThread(^{
         CAMutex::Locker locker(&stateMutex);
-        gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("outputDeviceUID"), outputDeviceUID);
+
+        if (outputDevicePriorityList) {
+            gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("outputDevicePriorityList"), outputDevicePriorityList);
+        }
     });
-    
+
     ExecuteInAudioOutputThread(^{
         setupTargetOutputDevice();
     });
+}
+
+// Serializes the stored priority list into a newline-delimited string for the
+// read channel. NB: the caller must hold stateMutex (this reads the list member).
+CFStringRef ProxyAudioDevice::copyOutputDevicePriorityListAsString() {
+    if (!outputDevicePriorityList || CFArrayGetCount(outputDevicePriorityList) == 0) {
+        return CFStringCreateCopy(NULL, CFSTR(""));
+    }
+
+    return CFStringCreateByCombiningStrings(NULL, outputDevicePriorityList, kOutputDevicePriorityListSeparator);
+}
+
+void ProxyAudioDevice::updateCurrentActiveOutputDeviceUID(AudioObjectID activeDeviceID) {
+    CFStringSmartRef uid;
+
+    if (activeDeviceID != kAudioObjectUnknown) {
+        uid = AudioDevice::copyDeviceUID(activeDeviceID);
+    }
+
+    CAMutex::Locker locker(&stateMutex);
+
+    if (outputDeviceUID) {
+        CFRelease(outputDeviceUID);
+        outputDeviceUID = NULL;
+    }
+
+    if (uid) {
+        outputDeviceUID = CFStringCreateCopy(NULL, uid);
+    }
 }
 
 UInt32 ProxyAudioDevice::retrieveOutputDeviceBufferFrameSizeFromStorage() {
@@ -5831,6 +6009,41 @@ void ProxyAudioDevice::setOutputDeviceHideWhenUnavailable(bool newHideWhenUnavai
     // re-query kAudioDevicePropertyIsHidden immediately instead of waiting for
     // the next device-availability transition.
     notifyHiddenPropertyChanged();
+}
+
+bool ProxyAudioDevice::retrieveOutputDeviceAutoFailbackFromStorage() {
+    DebugMsg("ProxyAudio: retrieveOutputDeviceAutoFailbackFromStorage");
+
+    if (!gPlugIn_Host) {
+        DebugMsg("ProxyAudio: retrieveOutputDeviceAutoFailbackFromStorage no plugin host");
+        return kOutputDeviceDefaultAutoFailback;
+    }
+
+    CFPropertyListSmartRef data;
+    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("outputDeviceAutoFailback"), &data);
+
+    if (data == NULL || CFGetTypeID(data) != CFBooleanGetTypeID()) {
+        DebugMsg("ProxyAudio: retrieveOutputDeviceAutoFailbackFromStorage finished returning default value");
+        return kOutputDeviceDefaultAutoFailback;
+    }
+
+    return CFBooleanGetValue(CFBooleanRef(CFPropertyListRef(data)));
+}
+
+void ProxyAudioDevice::setOutputDeviceAutoFailback(bool newAutoFailback) {
+    {
+        CAMutex::Locker locker(&stateMutex);
+        outputDeviceAutoFailback = newAutoFailback;
+        gPlugIn_Host->WriteToStorage(gPlugIn_Host,
+                                     CFSTR("outputDeviceAutoFailback"),
+                                     newAutoFailback ? kCFBooleanTrue : kCFBooleanFalse);
+    }
+
+    // Turning auto-failback on may mean we should immediately jump up to a
+    // higher-priority device that is currently available, so re-evaluate now.
+    ExecuteInAudioOutputThread(^{
+        setupTargetOutputDevice();
+    });
 }
 
 // Tell the host to re-read kAudioDevicePropertyIsHidden. We always notify,
