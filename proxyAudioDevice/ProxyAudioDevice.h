@@ -135,6 +135,16 @@ class ProxyAudioDevice {
     void setOutputDeviceHideWhenUnavailable(bool newHideWhenUnavailable);
     bool retrieveOutputDeviceAutoFailbackFromStorage();
     void setOutputDeviceAutoFailback(bool newAutoFailback);
+    // Pushes the proxy's current volume onto the active output device's hardware
+    // volume control, if that device has one (see outputDeviceHasHardwareVolume).
+    void applyVolumeToOutputDevice();
+    // Per-device volume memory: each device's last-used level is remembered by UID
+    // so switching to a device restores the volume it was last left at.
+    Float32 retrieveVolumeForDeviceUID(CFStringRef uid);
+    void saveVolumeForDeviceUID(CFStringRef uid, Float32 volume);
+    void saveVolumeForActiveDevice();
+    void restoreVolumeForActiveDevice();
+    void notifyVolumeChanged();
     void notifyHiddenPropertyChanged();
 
     static ProxyAudioDevice *deviceForDriver(void *inDriver);
@@ -567,6 +577,16 @@ class ProxyAudioDevice {
     Float32 gVolume_Output_L_Value = 0.0;
     Float32 gVolume_Output_R_Value = 0.0;
     bool gMute_Output_Mute = false;
+    // True when the active output device exposes a settable hardware volume, in
+    // which case the proxy drives that directly and the IO proc skips software
+    // attenuation (mute is still applied in software). Read from the realtime IO
+    // proc, so it's atomic.
+    std::atomic_bool outputDeviceHasHardwareVolume{false};
+    // The proxy's volume defaults to 0 and is only set once the system/user
+    // adjusts it (which happens when the proxy is selected as output). We don't
+    // push to a device's hardware volume until then, so we never zero a device's
+    // real hardware volume on startup. Guarded by stateMutex.
+    bool volumeHasBeenSet = false;
     const UInt32 gDevice_BytesPerFrameInChannel = 4;
     const UInt32 gDevice_ChannelsPerFrame = 2;
     const UInt32 gDevice_SafetyOffset = 0;

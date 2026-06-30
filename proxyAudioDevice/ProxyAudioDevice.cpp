@@ -4619,6 +4619,17 @@ OSStatus ProxyAudioDevice::SetControlPropertyData(AudioServerPlugInDriverRef inD
                     theAnswer = kAudioHardwareUnknownPropertyError;
                     break;
             };
+            {
+                CAMutex::Locker locker(&stateMutex);
+                volumeHasBeenSet = true;
+            }
+            // Mirror the new level onto the active device's hardware volume if it
+            // has one (no-op otherwise; software attenuation covers that case).
+            // stateMutex is already released here, so this won't nest locks.
+            applyVolumeToOutputDevice();
+            // Remember this level for the active device so it is restored next
+            // time we switch to it.
+            saveVolumeForActiveDevice();
             break;
 
         case kObjectID_Mute_Output_Master:
@@ -4979,6 +4990,7 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
     DebugMsg("ProxyAudio: setupTargetOutputDevice newOutputDevice: %d", newOutputDevice.id);
 
     AudioObjectID activeDeviceID = kAudioObjectUnknown;
+    bool deviceChanged = false;
     {
         CAMutex::Locker locker(outputDeviceMutex);
 
@@ -5012,7 +5024,13 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
                 DebugMsg("ProxyAudio: setupTargetOutputDevice will match sample rate");
                 matchOutputDeviceSampleRateNoLock();
                 activeDeviceID = outputDevice.id;
+                deviceChanged = true;
+                // Remember whether this device can have its hardware volume
+                // driven directly; the IO proc uses this to decide whether to
+                // also attenuate in software.
+                outputDeviceHasHardwareVolume = outputDevice.hasSettableVolumeControl();
             } else {
+                outputDeviceHasHardwareVolume = false;
                 syslog(LOG_WARNING, "ProxyAudio: setupTargetOutputDevice could not find output device");
             }
         }
@@ -5022,6 +5040,155 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
     // system-default fallback, or none) so the settings app can mark the active
     // row, read via ConfigType::currentActiveOutputDevice.
     updateCurrentActiveOutputDeviceUID(activeDeviceID);
+
+    // When we actually switched devices, restore the volume this device was last
+    // left at (or carry the current level over and remember it the first time).
+    if (deviceChanged) {
+        restoreVolumeForActiveDevice();
+    }
+
+    // Push the (possibly just-restored) proxy volume onto the new device's
+    // hardware volume control if it has one.
+    applyVolumeToOutputDevice();
+}
+
+void ProxyAudioDevice::applyVolumeToOutputDevice() {
+    // Snapshot the proxy's level (left channel is representative; the system sets
+    // left and right together). stateMutex is released before we take
+    // outputDeviceMutex so the two locks are never held at the same time.
+    Float32 volume;
+    bool hasBeenSet;
+    {
+        CAMutex::Locker locker(&stateMutex);
+        volume = gVolume_Output_L_Value;
+        hasBeenSet = volumeHasBeenSet;
+    }
+
+    // Don't touch a device's hardware volume until the proxy's volume has been
+    // set at least once, so we never zero out a real device on startup.
+    if (!hasBeenSet) {
+        return;
+    }
+
+    CAMutex::Locker locker(outputDeviceMutex);
+
+    if (outputDevice.isValid() && outputDeviceHasHardwareVolume.load()) {
+        outputDevice.setVolumeScalar(volume);
+    }
+}
+
+Float32 ProxyAudioDevice::retrieveVolumeForDeviceUID(CFStringRef uid) {
+    // Returns the remembered 0..1 volume for the device, or -1 if none is stored.
+    if (!gPlugIn_Host || !uid) {
+        return -1.0f;
+    }
+
+    CFPropertyListSmartRef data;
+    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("perDeviceVolume"), &data);
+
+    if (!data || CFGetTypeID(data) != CFDictionaryGetTypeID()) {
+        return -1.0f;
+    }
+
+    CFTypeRef value = CFDictionaryGetValue((CFDictionaryRef)CFPropertyListRef(data), uid);
+
+    if (!value || CFGetTypeID(value) != CFNumberGetTypeID()) {
+        return -1.0f;
+    }
+
+    Float32 volume = -1.0f;
+    CFNumberGetValue((CFNumberRef)value, kCFNumberFloat32Type, &volume);
+
+    return volume;
+}
+
+void ProxyAudioDevice::saveVolumeForDeviceUID(CFStringRef uid, Float32 volume) {
+    if (!gPlugIn_Host || !uid) {
+        return;
+    }
+
+    CFPropertyListSmartRef data;
+    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("perDeviceVolume"), &data);
+
+    CFMutableDictionaryRef dict;
+
+    if (data && CFGetTypeID(data) == CFDictionaryGetTypeID()) {
+        dict = CFDictionaryCreateMutableCopy(NULL, 0, (CFDictionaryRef)CFPropertyListRef(data));
+    } else {
+        dict = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    }
+
+    CFNumberSmartRef number = CFNumberCreate(NULL, kCFNumberFloat32Type, &volume);
+    CFDictionarySetValue(dict, uid, number);
+    gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("perDeviceVolume"), dict);
+    CFRelease(dict);
+}
+
+void ProxyAudioDevice::saveVolumeForActiveDevice() {
+    CFStringSmartRef uid;
+    Float32 volume;
+    bool hasBeenSet;
+    {
+        CAMutex::Locker locker(&stateMutex);
+        uid = outputDeviceUID ? CFStringCreateCopy(NULL, outputDeviceUID) : NULL;
+        volume = gVolume_Output_L_Value;
+        hasBeenSet = volumeHasBeenSet;
+    }
+
+    // Never persist the default-0 level we start at before the proxy is used.
+    if (!hasBeenSet || !uid) {
+        return;
+    }
+
+    saveVolumeForDeviceUID(uid, volume);
+}
+
+void ProxyAudioDevice::restoreVolumeForActiveDevice() {
+    CFStringSmartRef uid;
+    {
+        CAMutex::Locker locker(&stateMutex);
+        uid = outputDeviceUID ? CFStringCreateCopy(NULL, outputDeviceUID) : NULL;
+    }
+
+    if (!uid) {
+        return;
+    }
+
+    Float32 remembered = retrieveVolumeForDeviceUID(uid);
+
+    if (remembered < 0.0f) {
+        // First time we've seen this device: keep the current level (it carries
+        // over from the previous device) and remember it for next time.
+        saveVolumeForActiveDevice();
+        return;
+    }
+
+    {
+        CAMutex::Locker locker(&stateMutex);
+        gVolume_Output_L_Value = remembered;
+        gVolume_Output_R_Value = remembered;
+        volumeHasBeenSet = true;
+    }
+
+    // Let the system update its displayed volume to the restored level. Done
+    // outside stateMutex since the host may re-enter the driver to read it.
+    notifyVolumeChanged();
+}
+
+void ProxyAudioDevice::notifyVolumeChanged() {
+    if (!gPlugIn_Host) {
+        return;
+    }
+
+    AudioObjectPropertyAddress leftAddresses[2] = {
+        {kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, 1},
+        {kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, 1}};
+    gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Volume_Output_L, 2, leftAddresses);
+
+    AudioObjectPropertyAddress rightAddresses[2] = {
+        {kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, 2},
+        {kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, 2}};
+    gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Volume_Output_R, 2, rightAddresses);
 }
 
 void ProxyAudioDevice::initializeOutputDevice() {
@@ -5520,7 +5687,15 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
     }
     
     Float32 volumeFactorL = 1.0, volumeFactorR = 1.0;
-    calculateVolumeFactors(currentVolumeL, currentVolumeR, currentMute, volumeFactorL, volumeFactorR);
+
+    if (outputDeviceHasHardwareVolume.load()) {
+        // The device's hardware volume is already applying the level, so don't
+        // attenuate again in software (that would double-apply it). Still honor
+        // mute here so muting is instant and works on every device.
+        calculateVolumeFactors(1.0, 1.0, currentMute, volumeFactorL, volumeFactorR);
+    } else {
+        calculateVolumeFactors(currentVolumeL, currentVolumeR, currentMute, volumeFactorL, volumeFactorR);
+    }
 
     for (UInt32 bufferIndex = 0; bufferIndex < outOutputData->mNumberBuffers; bufferIndex++) {
         UInt32 outputChannelCount = outOutputData->mBuffers[bufferIndex].mNumberChannels;
