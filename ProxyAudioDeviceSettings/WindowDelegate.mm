@@ -460,7 +460,13 @@ int onDevicesChanged(AudioObjectID inObjectID,
     NSTextField *cell = [tableView makeViewWithIdentifier:identifier owner:self];
 
     if (!cell) {
-        cell = [NSTextField labelWithString:@""];
+        // Configure a non-editable label by hand: +[NSTextField labelWithString:]
+        // is 10.12+, and we support macOS 10.11.
+        cell = [[NSTextField alloc] initWithFrame:NSZeroRect];
+        cell.editable = NO;
+        cell.selectable = NO;
+        cell.bezeled = NO;
+        cell.drawsBackground = NO;
         cell.identifier = identifier;
         cell.lineBreakMode = NSLineBreakByTruncatingTail;
     }
@@ -818,10 +824,13 @@ static NSView *findSubviewByOrigin(NSView *parent, CGFloat x, CGFloat y) {
                                                  action:@selector(moveDeviceDownClicked:)
                                                 toolTip:NSLocalizedString(@"Move the selected device down", nil)];
 
-    // Auto-failback checkbox beneath the buttons.
-    NSButton *checkbox = [NSButton checkboxWithTitle:NSLocalizedString(@"Automatically switch back to higher-priority devices", nil)
-                                              target:self
-                                              action:@selector(autoFailbackToggled:)];
+    // Auto-failback checkbox beneath the buttons. +[NSButton checkboxWithTitle:...]
+    // is 10.12+, so configure a switch button by hand for macOS 10.11 support.
+    NSButton *checkbox = [[NSButton alloc] initWithFrame:NSZeroRect];
+    [checkbox setButtonType:NSButtonTypeSwitch];
+    checkbox.title = NSLocalizedString(@"Automatically switch back to higher-priority devices", nil);
+    checkbox.target = self;
+    checkbox.action = @selector(autoFailbackToggled:);
     checkbox.frame = NSMakeRect(kPriorityListLeftX, 257.0, kPriorityListWidth, 18.0);
     checkbox.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
     [contentView addSubview:checkbox];
@@ -837,7 +846,13 @@ static NSView *findSubviewByOrigin(NSView *parent, CGFloat x, CGFloat y) {
                                height:(CGFloat)height
                                action:(SEL)action
                               toolTip:(NSString *)toolTip {
-    NSButton *button = [NSButton buttonWithTitle:title target:self action:action];
+    // +[NSButton buttonWithTitle:...] is 10.12+; build a push button by hand to
+    // keep macOS 10.11 compatibility.
+    NSButton *button = [[NSButton alloc] initWithFrame:NSZeroRect];
+    [button setButtonType:NSButtonTypeMomentaryPushIn];
+    button.title = title;
+    button.target = self;
+    button.action = action;
     button.frame = NSMakeRect(x, y, width, height);
     button.bezelStyle = NSBezelStyleRounded;
     button.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
